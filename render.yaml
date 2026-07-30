@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: kea-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 4000
+      - key: JWT_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: FXS_BASE_URL
+        value: https://fxspay.onrender.com
+      - key: FXS_API_KEY
+        sync: false
+      - key: FXS_WEBHOOK_SECRET
+        sync: false
+      - key: VOTE_PRICE
+        value: 20
