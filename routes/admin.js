@@ -134,6 +134,27 @@ router.post('/nominees/:id/votes', async (req, res) => {
   res.json({ message: `${voteCount} vote(s) added`, transaction: txn });
 });
 
+// ---- All nominees across every category, with vote counts, in one query
+// (used by the admin dashboard instead of looping per-category) ----
+router.get('/nominees-overview', async (req, res) => {
+  const { data, error } = await supabase
+    .from('nominees')
+    .select('id, full_name, category_id, categories(name), votes(count)')
+    .order('full_name');
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  const result = data.map(n => ({
+    id: n.id,
+    full_name: n.full_name,
+    category_id: n.category_id,
+    categoryName: n.categories?.name || '—',
+    vote_count: n.votes?.[0]?.count || 0
+  }));
+
+  res.json(result);
+});
+
 // ---- Analytics ----
 router.get('/analytics', async (req, res) => {
   const { data: transactions, error: txnErr } = await supabase
