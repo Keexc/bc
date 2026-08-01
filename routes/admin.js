@@ -91,6 +91,49 @@ router.delete('/nominees/:id', async (req, res) => {
   res.json({ message: 'Nominee deleted' });
 });
 
+// ---- Manually add votes (corrections, sponsor/bonus votes, etc.) ----
+// Recorded as a KSh 0 transaction with status 'success' so it shows up in
+// the audit trail (transactions table) rather than just silently appearing
+// in the vote count.
+router.post('/nominees/:id/votes', async (req, res) => {
+  const { count, note } = req.body;
+  const voteCount = parseInt(count, 10);
+
+  if (!voteCount || voteCount < 1) {
+    return res.status(400).json({ error: 'count must be a positive integer' });
+  }
+
+  const { data: nominee, error: nomErr } = await supabase
+    .from('nominees')
+    .select('id')
+    .eq('id', req.params.id)
+    .single();
+  if (nomErr || !nominee) return res.status(404).json({ error: 'Nominee not found' });
+
+  const { data: txn, error: txnErr } = await supabase
+    .from('transactions')
+    .insert({
+      nominee_id: nominee.id,
+      phone_number: `ADMIN:${req.admin.email}`,
+      amount: 0,
+      votes_requested: voteCount,
+      status: 'success',
+      result_desc: note || 'Manually added by admin'
+    })
+    .select()
+    .single();
+  if (txnErr) return res.status(500).json({ error: txnErr.message });
+
+  const voteRows = Array.from({ length: voteCount }, () => ({
+    nominee_id: nominee.id,
+    transaction_id: txn.id
+  }));
+  const { error: voteErr } = await supabase.from('votes').insert(voteRows);
+  if (voteErr) return res.status(500).json({ error: voteErr.message });
+
+  res.json({ message: `${voteCount} vote(s) added`, transaction: txn });
+});
+
 // ---- Analytics ----
 router.get('/analytics', async (req, res) => {
   const { data: transactions, error: txnErr } = await supabase
