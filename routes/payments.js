@@ -10,30 +10,8 @@ const VOTE_PRICE = Number(process.env.VOTE_PRICE || 20);
 const fxsClient = axios.create({
   baseURL: process.env.FXS_BASE_URL,
   headers: { Authorization: `Bearer ${process.env.FXS_API_KEY}` },
-  timeout: 30000
+  timeout: 15000
 });
-
-// If our own stk-push request errors out (timeout, network blip, etc.) it's
-// possible FXS Pay actually received and processed it anyway — we just never
-// got their transactionId back to store as fxs_reference. Without that, the
-// later success webhook has nothing to match against and silently drops,
-// even though the voter completed payment. This checks FXS Pay's own recent
-// transactions list for a matching phone+amount request that went through,
-// so we can still link it up.
-async function reconcileMissedResponse(phone, amount) {
-  try {
-    const { data } = await fxsClient.get('/api/mpesa/transactions?limit=15');
-    const candidates = (data.transactions || data || []).filter(t => {
-      const sameAmount = Number(t.amount) === Number(amount);
-      const samePhone = String(t.phone || t.customer_phone || '').includes(phone.slice(-9));
-      const recent = new Date() - new Date(t.created_at || t.createdAt) < 3 * 60 * 1000; // within 3 min
-      return sameAmount && samePhone && recent;
-    });
-    return candidates[0] || null;
-  } catch (_) {
-    return null; // reconciliation is best-effort — if it fails, fall through to normal failure handling
-  }
-}
 
 // Basic abuse protection on the payment-initiate endpoint
 const initiateLimiter = rateLimit({
@@ -109,23 +87,6 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
       });
       fxsResponse = data; // { message, transactionId, paystackStatus }
     } catch (pushErr) {
-      // Our request errored (timeout, network blip, 5xx) — but FXS Pay may
-      // have still received and processed it. Check before declaring it a
-      // failure, so a voter who actually paid doesn't lose their vote.
-      const match = await reconcileMissedResponse(normalizedPhone, amount);
-
-      if (match) {
-        await supabase
-          .from('transactions')
-          .update({ fxs_reference: match.id || match.transactionId })
-          .eq('id', txn.id);
-
-        return res.json({
-          message: 'STK Push sent. Enter your M-Pesa PIN on your phone to complete payment.',
-          transactionId: txn.id
-        });
-      }
-
       const providerMsg = pushErr.response?.data?.error;
       await supabase
         .from('transactions')
