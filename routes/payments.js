@@ -13,28 +13,6 @@ const fxsClient = axios.create({
   timeout: 30000
 });
 
-// If our own stk-push request errors out (timeout, network blip, etc.) it's
-// possible FXS Pay actually received and processed it anyway — we just never
-// got their transactionId back to store as fxs_reference. Without that, the
-// later success webhook has nothing to match against and silently drops,
-// even though the voter completed payment. This checks FXS Pay's own recent
-// transactions list for a matching phone+amount request that went through,
-// so we can still link it up.
-async function reconcileMissedResponse(phone, amount) {
-  try {
-    const { data } = await fxsClient.get('/api/mpesa/transactions?limit=15');
-    const candidates = (data.transactions || data || []).filter(t => {
-      const sameAmount = Number(t.amount) === Number(amount);
-      const samePhone = String(t.phone || t.customer_phone || '').includes(phone.slice(-9));
-      const recent = new Date() - new Date(t.created_at || t.createdAt) < 3 * 60 * 1000; // within 3 min
-      return sameAmount && samePhone && recent;
-    });
-    return candidates[0] || null;
-  } catch (_) {
-    return null; // reconciliation is best-effort — if it fails, fall through to normal failure handling
-  }
-}
-
 // Basic abuse protection on the payment-initiate endpoint
 const initiateLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -43,8 +21,6 @@ const initiateLimiter = rateLimit({
 });
 
 function normalizePhone(raw) {
-  // FXS Pay normalizes phone formats itself, but we validate before
-  // spending a request so users get fast feedback on typos.
   let phone = String(raw).trim().replace(/\s+/g, '');
   if (phone.startsWith('+')) phone = phone.slice(1);
   if (phone.startsWith('0')) phone = '254' + phone.slice(1);
@@ -53,6 +29,43 @@ function normalizePhone(raw) {
 
 function isValidSafaricomNumber(phone) {
   return /^254(7|1)\d{8}$/.test(phone);
+}
+
+// Looks up FXS Pay's own transaction list for a request matching this
+// phone+amount that actually went through, so we can link our record to
+// theirs even if our original request to them errored out. Used both right
+// after a failed initiate call AND on every subsequent status poll, since a
+// voter can take well over a minute to enter their PIN — a single lookup
+// immediately after the error is usually too early to find anything yet.
+async function reconcileMissedResponse(phone, amount) {
+  try {
+    const { data } = await fxsClient.get('/api/mpesa/transactions?limit=20');
+    const list = data.transactions || data.data || data || [];
+
+    const getPhone = t => t.phone || t.customerPhone || t.customer_phone || t.msisdn || t.phoneNumber || t.mpesaNumber || '';
+    const getCreated = t => t.created_at || t.createdAt || t.timestamp || t.date;
+    const last9 = phone.slice(-9);
+
+    const withinWindow = t => {
+      const created = getCreated(t);
+      return created ? (Date.now() - new Date(created).getTime()) < 15 * 60 * 1000 : true;
+    };
+
+    const exact = list.find(t =>
+      Number(t.amount) === Number(amount) &&
+      String(getPhone(t)).includes(last9) &&
+      withinWindow(t)
+    );
+    if (exact) return exact;
+
+    console.error('[reconcile] no phone match, raw FXS transactions sample:', JSON.stringify(list.slice(0, 3)));
+
+    // Fallback: amount + recency only (less precise, still better than nothing)
+    return list.find(t => Number(t.amount) === Number(amount) && withinWindow(t)) || null;
+  } catch (err) {
+    console.error('[reconcile] lookup itself failed:', err.response?.data || err.message);
+    return null;
+  }
 }
 
 // POST /api/payments/initiate
@@ -71,7 +84,6 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Enter a valid Safaricom M-Pesa number' });
     }
 
-    // Confirm the nominee exists and voting is open for its category
     const { data: nominee, error: nomErr } = await supabase
       .from('nominees')
       .select('id, full_name, is_active, category_id, categories!inner(is_active)')
@@ -84,8 +96,6 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
 
     const amount = voteCount * VOTE_PRICE;
 
-    // Create our own pending row first (votes_requested lives here, since
-    // FXS Pay only ever knows the KES amount, not "votes")
     const { data: txn, error: txnErr } = await supabase
       .from('transactions')
       .insert({
@@ -100,59 +110,67 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
 
     if (txnErr) return res.status(500).json({ error: txnErr.message });
 
-    let fxsResponse;
     try {
       const { data } = await fxsClient.post('/api/mpesa/stk-push', {
         phone: normalizedPhone,
         amount,
         description: `${voteCount} vote(s) for ${nominee.full_name}`
       });
-      fxsResponse = data; // { message, transactionId, paystackStatus }
-    } catch (pushErr) {
-      // Our request errored (timeout, network blip, 5xx) — but FXS Pay may
-      // have still received and processed it. Check before declaring it a
-      // failure, so a voter who actually paid doesn't lose their vote.
-      const match = await reconcileMissedResponse(normalizedPhone, amount);
 
+      // Got a clean response — save FXS Pay's transactionId as our matching key
+      await supabase
+        .from('transactions')
+        .update({ fxs_reference: data.transactionId })
+        .eq('id', txn.id);
+
+      return res.json({
+        message: data.message || 'STK Push sent. Enter your M-Pesa PIN on your phone to complete payment.',
+        transactionId: txn.id
+      });
+    } catch (pushErr) {
+      // FXS Pay gave us an actual error response (bad request, auth issue,
+      // etc.) — this is a genuine failure, not just slowness.
+      if (pushErr.response && pushErr.response.status < 500) {
+        await supabase
+          .from('transactions')
+          .update({ status: 'failed', result_desc: pushErr.response.data?.error || 'Payment request rejected' })
+          .eq('id', txn.id);
+        return res.status(502).json({ error: pushErr.response.data?.error || 'Could not start payment. Please try again.' });
+      }
+
+      // Timeout, network blip, or a 5xx from FXS Pay — we genuinely don't
+      // know if the prompt went out. Try an immediate reconciliation check,
+      // but either way DON'T declare failure: a voter can take well over a
+      // minute to enter their PIN, and the /status polling below (plus this
+      // same reconciliation check running again on every poll) has plenty
+      // more chances to catch up. Wrongly failing here is worse than a
+      // slightly optimistic "pending" — it's what was silently losing paid
+      // votes.
+      const match = await reconcileMissedResponse(normalizedPhone, amount);
       if (match) {
         await supabase
           .from('transactions')
           .update({ fxs_reference: match.id || match.transactionId })
           .eq('id', txn.id);
-
-        return res.json({
-          message: 'STK Push sent. Enter your M-Pesa PIN on your phone to complete payment.',
-          transactionId: txn.id
-        });
+      } else {
+        console.error('[initiate] stk-push errored with no immediate match, leaving pending for status polling:', pushErr.message);
       }
 
-      const providerMsg = pushErr.response?.data?.error;
-      await supabase
-        .from('transactions')
-        .update({ status: 'failed', result_desc: providerMsg || 'STK push request failed to send' })
-        .eq('id', txn.id);
-      return res.status(502).json({ error: 'Could not reach the payment provider. Please try again.' });
+      return res.json({
+        message: 'STK Push sent. If you don\u2019t see a prompt within a minute, you can try again.',
+        transactionId: txn.id
+      });
     }
-
-    // FXS Pay's own transactionId is what its webhook will reference later —
-    // save it as our matching key.
-    await supabase
-      .from('transactions')
-      .update({ fxs_reference: fxsResponse.transactionId })
-      .eq('id', txn.id);
-
-    res.json({
-      message: fxsResponse.message || 'STK Push sent. Enter your M-Pesa PIN on your phone to complete payment.',
-      transactionId: txn.id
-    });
   } catch (err) {
     res.status(500).json({ error: 'Unexpected error initiating payment' });
   }
 });
 
-// GET /api/payments/status/:transactionId — our own row, for the frontend to poll.
-// Falls back to asking FXS Pay directly if we're still pending and haven't
-// heard a webhook yet, in case the webhook is delayed or was missed.
+// GET /api/payments/status/:transactionId — polled by the frontend.
+// If we're still pending, this actively tries to catch up: first attempting
+// to link an unmatched transaction (if the initiate call never got a
+// fxs_reference), then checking FXS Pay's status for whatever reference we
+// do have.
 router.get('/status/:transactionId', async (req, res) => {
   const { data: txn, error } = await supabase
     .from('transactions')
@@ -162,33 +180,45 @@ router.get('/status/:transactionId', async (req, res) => {
 
   if (error || !txn) return res.status(404).json({ error: 'Transaction not found' });
 
-  if (txn.status === 'pending' && txn.fxs_reference) {
-    try {
-      const { data } = await fxsClient.get(`/api/mpesa/status/${txn.fxs_reference}`);
-      const providerStatus = data.transaction?.status;
-      if (providerStatus === 'success' || providerStatus === 'failed') {
-        await creditOrFailTransaction(txn, providerStatus, {});
-        return res.json({ status: providerStatus, votes_requested: txn.votes_requested });
-      }
-    } catch (_) {
-      // Ignore — fall through and report our last known status. The
-      // webhook is still the primary path; this is just a fallback poll.
+  if (txn.status !== 'pending') {
+    return res.json({ status: txn.status, votes_requested: txn.votes_requested, mpesa_receipt: txn.mpesa_receipt });
+  }
+
+  let fxsRef = txn.fxs_reference;
+
+  if (!fxsRef) {
+    const match = await reconcileMissedResponse(txn.phone_number, txn.amount);
+    if (match) {
+      fxsRef = match.id || match.transactionId;
+      await supabase.from('transactions').update({ fxs_reference: fxsRef }).eq('id', txn.id);
     }
   }
 
-  res.json({ status: txn.status, votes_requested: txn.votes_requested, mpesa_receipt: txn.mpesa_receipt });
+  if (fxsRef) {
+    try {
+      const { data } = await fxsClient.get(`/api/mpesa/status/${fxsRef}`);
+      const providerStatus = data.transaction?.status;
+      if (providerStatus === 'success' || providerStatus === 'failed') {
+        await creditOrFailTransaction({ ...txn, fxs_reference: fxsRef }, providerStatus, {});
+        return res.json({ status: providerStatus, votes_requested: txn.votes_requested });
+      }
+    } catch (_) {
+      // Ignore — the webhook is still the primary path; this is a fallback poll.
+    }
+  }
+
+  res.json({ status: 'pending', votes_requested: txn.votes_requested });
 });
 
 // Shared logic for marking a transaction resolved and crediting votes,
 // used by both the webhook and the status-poll fallback above.
 async function creditOrFailTransaction(txn, status, extra) {
-  // Idempotency guard — never process (or double-credit) a transaction twice
   const { data: fresh } = await supabase
     .from('transactions')
     .select('status')
     .eq('id', txn.id)
     .single();
-  if (fresh.status === 'success' || fresh.status === 'failed') return;
+  if (fresh.status === 'success' || fresh.status === 'failed') return; // idempotency guard
 
   await supabase
     .from('transactions')
@@ -211,7 +241,6 @@ async function creditOrFailTransaction(txn, status, extra) {
 }
 
 // POST /api/payments/webhook — FXS Pay calls this when a payment resolves.
-// Relies on req.rawBody (captured in server.js) for signature verification.
 router.post('/webhook', async (req, res) => {
   try {
     const signature = req.headers['x-fxspay-signature'];
@@ -226,19 +255,34 @@ router.post('/webhook', async (req, res) => {
       return res.status(401).json({ error: 'Invalid webhook signature' });
     }
 
-    const { transactionId, receiptUrl, reason } = req.body;
+    const { transactionId, amount, receiptUrl, reason } = req.body;
     if (!transactionId) return res.status(400).json({ error: 'Missing transactionId' });
 
-    const { data: txn, error } = await supabase
+    let { data: txn } = await supabase
       .from('transactions')
       .select('*')
       .eq('fxs_reference', transactionId)
       .single();
 
-    if (error || !txn) {
-      // Respond 200 anyway — an unknown reference isn't something FXS Pay
-      // should keep retrying, and swallowing it here avoids blocking their
-      // delivery queue on our side.
+    // No transaction has this fxs_reference yet — likely one whose initiate
+    // call errored out before it could save it. Fall back to the oldest
+    // still-pending, not-yet-linked transaction with a matching amount.
+    if (!txn && amount) {
+      const { data: candidates } = await supabase
+        .from('transactions')
+        .select('*')
+        .eq('status', 'pending')
+        .is('fxs_reference', null)
+        .eq('amount', amount)
+        .order('created_at', { ascending: true })
+        .limit(1);
+      txn = candidates?.[0];
+      if (txn) {
+        await supabase.from('transactions').update({ fxs_reference: transactionId }).eq('id', txn.id);
+      }
+    }
+
+    if (!txn) {
       return res.status(200).json({ message: 'No matching transaction' });
     }
 
