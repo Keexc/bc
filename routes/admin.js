@@ -134,6 +134,62 @@ router.post('/nominees/:id/votes', async (req, res) => {
   res.json({ message: `${voteCount} vote(s) added`, transaction: txn });
 });
 
+// ---- Manually deduct votes (e.g. correcting votes wrongly credited
+// without a real payment) ----
+// Deletes actual rows from the votes table (that's what the public count is
+// derived from) and logs a KSh 0 audit-trail transaction with a negative
+// votes_requested so the correction is visible in the transactions log/export.
+router.post('/nominees/:id/votes/deduct', async (req, res) => {
+  const { count, note } = req.body;
+  const voteCount = parseInt(count, 10);
+
+  if (!voteCount || voteCount < 1) {
+    return res.status(400).json({ error: 'count must be a positive integer' });
+  }
+
+  const { data: nominee, error: nomErr } = await supabase
+    .from('nominees')
+    .select('id')
+    .eq('id', req.params.id)
+    .single();
+  if (nomErr || !nominee) return res.status(404).json({ error: 'Nominee not found' });
+
+  // Pick the oldest votes for this nominee to remove first
+  const { data: voteRows, error: fetchErr } = await supabase
+    .from('votes')
+    .select('id')
+    .eq('nominee_id', nominee.id)
+    .order('created_at', { ascending: true })
+    .limit(voteCount);
+  if (fetchErr) return res.status(500).json({ error: fetchErr.message });
+
+  if (!voteRows.length) {
+    return res.status(400).json({ error: 'This nominee has no votes to deduct' });
+  }
+
+  const { error: delErr } = await supabase
+    .from('votes')
+    .delete()
+    .in('id', voteRows.map(v => v.id));
+  if (delErr) return res.status(500).json({ error: delErr.message });
+
+  const { data: txn, error: txnErr } = await supabase
+    .from('transactions')
+    .insert({
+      nominee_id: nominee.id,
+      phone_number: `ADMIN:${req.admin.email}`,
+      amount: 0,
+      votes_requested: -voteRows.length,
+      status: 'success',
+      result_desc: note || 'Manually deducted by admin'
+    })
+    .select()
+    .single();
+  if (txnErr) return res.status(500).json({ error: txnErr.message });
+
+  res.json({ message: `${voteRows.length} vote(s) deducted`, transaction: txn });
+});
+
 // ---- All nominees across every category, with vote counts, in one query
 // (used by the admin dashboard instead of looping per-category) ----
 router.get('/nominees-overview', async (req, res) => {

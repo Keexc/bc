@@ -51,17 +51,23 @@ async function reconcileMissedResponse(phone, amount) {
       return created ? (Date.now() - new Date(created).getTime()) < 15 * 60 * 1000 : true;
     };
 
+    // Phone match is mandatory. Matching by amount alone is NOT safe here —
+    // with many voters paying the same standard amount (e.g. KSh 20), an
+    // amount-only match can attach this voter's pending record to a
+    // DIFFERENT voter's already-completed transaction, crediting votes to
+    // someone who never paid. A wrong "no match" is fine (falls back to
+    // pending/manual review); a wrong match is not.
     const exact = list.find(t =>
       Number(t.amount) === Number(amount) &&
       String(getPhone(t)).includes(last9) &&
       withinWindow(t)
     );
-    if (exact) return exact;
 
-    console.error('[reconcile] no phone match, raw FXS transactions sample:', JSON.stringify(list.slice(0, 3)));
+    if (!exact) {
+      console.error('[reconcile] no phone match found, raw FXS transactions sample:', JSON.stringify(list.slice(0, 3)));
+    }
 
-    // Fallback: amount + recency only (less precise, still better than nothing)
-    return list.find(t => Number(t.amount) === Number(amount) && withinWindow(t)) || null;
+    return exact || null;
   } catch (err) {
     console.error('[reconcile] lookup itself failed:', err.response?.data || err.message);
     return null;
@@ -264,25 +270,15 @@ router.post('/webhook', async (req, res) => {
       .eq('fxs_reference', transactionId)
       .single();
 
-    // No transaction has this fxs_reference yet — likely one whose initiate
-    // call errored out before it could save it. Fall back to the oldest
-    // still-pending, not-yet-linked transaction with a matching amount.
-    if (!txn && amount) {
-      const { data: candidates } = await supabase
-        .from('transactions')
-        .select('*')
-        .eq('status', 'pending')
-        .is('fxs_reference', null)
-        .eq('amount', amount)
-        .order('created_at', { ascending: true })
-        .limit(1);
-      txn = candidates?.[0];
-      if (txn) {
-        await supabase.from('transactions').update({ fxs_reference: transactionId }).eq('id', txn.id);
-      }
-    }
-
+    // If we don't have an exact fxs_reference match, we do NOT guess by
+    // amount alone here — FXS Pay's webhook payload has no phone number to
+    // narrow it down, and with several voters paying the same amount
+    // (e.g. KSh 20) an amount-only match can credit votes to a different
+    // voter than the one who actually paid. Better to leave it unresolved
+    // (log it for manual review via the admin "Add votes" action) than to
+    // silently credit the wrong person.
     if (!txn) {
+      console.error('[webhook] no fxs_reference match for transactionId', transactionId, '— amount:', amount, '— needs manual review if this was a real payment');
       return res.status(200).json({ message: 'No matching transaction' });
     }
 
