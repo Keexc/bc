@@ -7,6 +7,12 @@ const paymentRoutes = require('./routes/payments');
 const adminRoutes = require('./routes/admin');
 
 const app = express();
+
+// Render sits behind a proxy — without this, express-rate-limit can't
+// safely use the X-Forwarded-For header to identify clients and throws
+// a validation error on every request.
+app.set('trust proxy', 1);
+
 app.use(cors());
 // The `verify` hook stashes the raw body bytes on req.rawBody, needed to
 // check the FXS Pay webhook's HMAC signature (must be computed over the
