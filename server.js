@@ -15,8 +15,8 @@ app.set('trust proxy', 1);
 
 app.use(cors());
 // The `verify` hook stashes the raw body bytes on req.rawBody, needed to
-// check the FXS Pay webhook's HMAC signature (must be computed over the
-// exact raw bytes, not a re-serialized JSON.stringify(req.body)).
+// check the Paystack webhook's HMAC-SHA512 signature (must be computed over
+// the exact raw bytes, not a re-serialized JSON.stringify(req.body)).
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 app.get('/', (req, res) => res.json({ status: 'Kenyan Excellence Awards API running' }));
