@@ -7,9 +7,9 @@ const supabase = require('../supabaseClient');
 
 const VOTE_PRICE = Number(process.env.VOTE_PRICE || 20);
 
-const fxsClient = axios.create({
-  baseURL: process.env.FXS_BASE_URL,
-  headers: { Authorization: `Bearer ${process.env.FXS_API_KEY}` },
+const paystackClient = axios.create({
+  baseURL: 'https://api.paystack.co',
+  headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
   timeout: 30000
 });
 
@@ -31,47 +31,23 @@ function isValidSafaricomNumber(phone) {
   return /^254(7|1)\d{8}$/.test(phone);
 }
 
-// Looks up FXS Pay's own transaction list for a request matching this
-// phone+amount that actually went through, so we can link our record to
-// theirs even if our original request to them errored out. Used both right
-// after a failed initiate call AND on every subsequent status poll, since a
-// voter can take well over a minute to enter their PIN — a single lookup
-// immediately after the error is usually too early to find anything yet.
-async function reconcileMissedResponse(phone, amount) {
-  try {
-    const { data } = await fxsClient.get('/api/mpesa/transactions?limit=20');
-    const list = data.transactions || data.data || data || [];
+// Paystack has no bulk "list transactions" reconciliation step to worry
+// about like FXS Pay did. We generate our OWN unique reference before ever
+// calling Paystack and store it on the transaction immediately, so the
+// reference is never ambiguous or missing — even if the /charge call times
+// out or errors, we already know which reference to poll/verify against.
+// GET /charge/:reference (below) always tells us the true status for that
+// exact reference. There is no phone/amount matching, so there's no way to
+// accidentally attach one voter's payment to a different voter's record.
+function generateReference(txnId) {
+  return `kea_${txnId}_${crypto.randomBytes(4).toString('hex')}`;
+}
 
-    const getPhone = t => t.phone || t.customerPhone || t.customer_phone || t.msisdn || t.phoneNumber || t.mpesaNumber || '';
-    const getCreated = t => t.created_at || t.createdAt || t.timestamp || t.date;
-    const last9 = phone.slice(-9);
-
-    const withinWindow = t => {
-      const created = getCreated(t);
-      return created ? (Date.now() - new Date(created).getTime()) < 15 * 60 * 1000 : true;
-    };
-
-    // Phone match is mandatory. Matching by amount alone is NOT safe here —
-    // with many voters paying the same standard amount (e.g. KSh 20), an
-    // amount-only match can attach this voter's pending record to a
-    // DIFFERENT voter's already-completed transaction, crediting votes to
-    // someone who never paid. A wrong "no match" is fine (falls back to
-    // pending/manual review); a wrong match is not.
-    const exact = list.find(t =>
-      Number(t.amount) === Number(amount) &&
-      String(getPhone(t)).includes(last9) &&
-      withinWindow(t)
-    );
-
-    if (!exact) {
-      console.error('[reconcile] no phone match found, raw FXS transactions sample:', JSON.stringify(list.slice(0, 3)));
-    }
-
-    return exact || null;
-  } catch (err) {
-    console.error('[reconcile] lookup itself failed:', err.response?.data || err.message);
-    return null;
-  }
+// Paystack requires an email on every /charge call even though it's not
+// used for mobile money. We synthesize one from the phone number since
+// voters don't provide an email anywhere in this flow.
+function placeholderEmail(phone) {
+  return `voter-${phone}@kea-awards.local`;
 }
 
 // POST /api/payments/initiate
@@ -116,52 +92,59 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
 
     if (txnErr) return res.status(500).json({ error: txnErr.message });
 
+    // Reference is generated and saved BEFORE calling Paystack, so we always
+    // have a way to check status even if this next call times out or errors.
+    const reference = generateReference(txn.id);
+    await supabase
+      .from('transactions')
+      .update({ paystack_reference: reference })
+      .eq('id', txn.id);
+
     try {
-      const { data } = await fxsClient.post('/api/mpesa/stk-push', {
-        phone: normalizedPhone,
-        amount,
-        description: `${voteCount} vote(s) for ${nominee.full_name}`
+      const { data } = await paystackClient.post('/charge', {
+        email: placeholderEmail(normalizedPhone),
+        amount: String(amount * 100), // Paystack amount is in the smallest unit (cents) for KES
+        currency: 'KES',
+        reference,
+        mobile_money: {
+          phone: `+${normalizedPhone}`,
+          provider: 'mpesa'
+        }
       });
 
-      // Got a clean response — save FXS Pay's transactionId as our matching key
-      await supabase
-        .from('transactions')
-        .update({ fxs_reference: data.transactionId })
-        .eq('id', txn.id);
+      const status = data.data?.status; // e.g. 'pay_offline', 'success', 'failed'
 
+      if (status === 'success') {
+        await creditOrFailTransaction(txn, 'success', { raw: data.data });
+        return res.json({
+          message: 'Payment confirmed. Thank you for voting!',
+          transactionId: txn.id
+        });
+      }
+
+      if (status === 'failed') {
+        await supabase
+          .from('transactions')
+          .update({ status: 'failed', result_desc: data.data?.gateway_response || 'Payment failed' })
+          .eq('id', txn.id);
+        return res.status(502).json({ error: data.data?.gateway_response || 'Payment failed. Please try again.' });
+      }
+
+      // pay_offline / send_otp / pending, etc. — STK prompt is out on the
+      // customer's phone. Leave status pending; /status polling and the
+      // webhook will resolve it.
       return res.json({
-        message: data.message || 'STK Push sent. Enter your M-Pesa PIN on your phone to complete payment.',
+        message: 'STK Push sent. Enter your M-Pesa PIN on your phone to complete payment.',
         transactionId: txn.id
       });
     } catch (pushErr) {
-      // FXS Pay gave us an actual error response (bad request, auth issue,
-      // etc.) — this is a genuine failure, not just slowness.
-      if (pushErr.response && pushErr.response.status < 500) {
-        await supabase
-          .from('transactions')
-          .update({ status: 'failed', result_desc: pushErr.response.data?.error || 'Payment request rejected' })
-          .eq('id', txn.id);
-        return res.status(502).json({ error: pushErr.response.data?.error || 'Could not start payment. Please try again.' });
-      }
-
-      // Timeout, network blip, or a 5xx from FXS Pay — we genuinely don't
-      // know if the prompt went out. Try an immediate reconciliation check,
-      // but either way DON'T declare failure: a voter can take well over a
-      // minute to enter their PIN, and the /status polling below (plus this
-      // same reconciliation check running again on every poll) has plenty
-      // more chances to catch up. Wrongly failing here is worse than a
-      // slightly optimistic "pending" — it's what was silently losing paid
-      // votes.
-      const match = await reconcileMissedResponse(normalizedPhone, amount);
-      if (match) {
-        await supabase
-          .from('transactions')
-          .update({ fxs_reference: match.id || match.transactionId })
-          .eq('id', txn.id);
-      } else {
-        console.error('[initiate] stk-push errored with no immediate match, leaving pending for status polling:', pushErr.message);
-      }
-
+      // Network error, timeout, or 5xx from Paystack while placing the
+      // charge — we genuinely don't know if the STK prompt went out.
+      // Because we already saved our own reference, we don't need any
+      // guesswork here: leave the transaction pending and let /status
+      // (Check Pending Charge) and the webhook resolve it once Paystack
+      // catches up.
+      console.error('[initiate] /charge request errored, leaving pending for status polling/webhook:', pushErr.response?.data || pushErr.message);
       return res.json({
         message: 'STK Push sent. If you don\u2019t see a prompt within a minute, you can try again.',
         transactionId: txn.id
@@ -173,10 +156,8 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
 });
 
 // GET /api/payments/status/:transactionId — polled by the frontend.
-// If we're still pending, this actively tries to catch up: first attempting
-// to link an unmatched transaction (if the initiate call never got a
-// fxs_reference), then checking FXS Pay's status for whatever reference we
-// do have.
+// If we're still pending, ask Paystack directly for the status of our own
+// reference via the Check Pending Charge endpoint.
 router.get('/status/:transactionId', async (req, res) => {
   const { data: txn, error } = await supabase
     .from('transactions')
@@ -190,22 +171,12 @@ router.get('/status/:transactionId', async (req, res) => {
     return res.json({ status: txn.status, votes_requested: txn.votes_requested, mpesa_receipt: txn.mpesa_receipt });
   }
 
-  let fxsRef = txn.fxs_reference;
-
-  if (!fxsRef) {
-    const match = await reconcileMissedResponse(txn.phone_number, txn.amount);
-    if (match) {
-      fxsRef = match.id || match.transactionId;
-      await supabase.from('transactions').update({ fxs_reference: fxsRef }).eq('id', txn.id);
-    }
-  }
-
-  if (fxsRef) {
+  if (txn.paystack_reference) {
     try {
-      const { data } = await fxsClient.get(`/api/mpesa/status/${fxsRef}`);
-      const providerStatus = data.transaction?.status;
+      const { data } = await paystackClient.get(`/charge/${txn.paystack_reference}`);
+      const providerStatus = data.data?.status;
       if (providerStatus === 'success' || providerStatus === 'failed') {
-        await creditOrFailTransaction({ ...txn, fxs_reference: fxsRef }, providerStatus, {});
+        await creditOrFailTransaction(txn, providerStatus, { raw: data.data, reason: data.data?.gateway_response });
         return res.json({ status: providerStatus, votes_requested: txn.votes_requested });
       }
     } catch (_) {
@@ -246,14 +217,17 @@ async function creditOrFailTransaction(txn, status, extra) {
   }
 }
 
-// POST /api/payments/webhook — FXS Pay calls this when a payment resolves.
+// POST /api/payments/webhook — Paystack calls this when a payment resolves.
+// Signature is HMAC-SHA512 of the raw request body, keyed with your
+// Paystack SECRET key (not a separate webhook secret — Paystack has no
+// registration step for webhooks; you set the URL by hand in
+// Dashboard > Settings > API Keys & Webhooks, for both test and live mode).
 router.post('/webhook', async (req, res) => {
   try {
-    const signature = req.headers['x-fxspay-signature'];
-    const event = req.headers['x-fxspay-event'];
+    const signature = req.headers['x-paystack-signature'];
 
     const expected = crypto
-      .createHmac('sha256', process.env.FXS_WEBHOOK_SECRET)
+      .createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
       .update(req.rawBody || Buffer.from(JSON.stringify(req.body)))
       .digest('hex');
 
@@ -261,29 +235,32 @@ router.post('/webhook', async (req, res) => {
       return res.status(401).json({ error: 'Invalid webhook signature' });
     }
 
-    const { transactionId, amount, receiptUrl, reason } = req.body;
-    if (!transactionId) return res.status(400).json({ error: 'Missing transactionId' });
+    const { event, data } = req.body;
+    const reference = data?.reference;
+    if (!reference) return res.status(400).json({ error: 'Missing reference' });
 
-    let { data: txn } = await supabase
+    // We generated this reference ourselves at /initiate time and stored it
+    // immediately, so this lookup is exact — no amount-based fallback
+    // matching is needed (or safe to do), which removes the whole class of
+    // "credited the wrong voter" bugs the FXS Pay integration had to guard
+    // against.
+    const { data: txn } = await supabase
       .from('transactions')
       .select('*')
-      .eq('fxs_reference', transactionId)
+      .eq('paystack_reference', reference)
       .single();
 
-    // If we don't have an exact fxs_reference match, we do NOT guess by
-    // amount alone here — FXS Pay's webhook payload has no phone number to
-    // narrow it down, and with several voters paying the same amount
-    // (e.g. KSh 20) an amount-only match can credit votes to a different
-    // voter than the one who actually paid. Better to leave it unresolved
-    // (log it for manual review via the admin "Add votes" action) than to
-    // silently credit the wrong person.
     if (!txn) {
-      console.error('[webhook] no fxs_reference match for transactionId', transactionId, '— amount:', amount, '— needs manual review if this was a real payment');
+      console.error('[webhook] no transaction found for reference', reference, '— needs manual review if this was a real payment');
       return res.status(200).json({ message: 'No matching transaction' });
     }
 
-    const status = event === 'payment.success' ? 'success' : 'failed';
-    await creditOrFailTransaction(txn, status, { receiptUrl, reason, raw: req.body });
+    if (event === 'charge.success') {
+      await creditOrFailTransaction(txn, 'success', { receiptUrl: data.receipt_number, reason: data.gateway_response, raw: data });
+    } else if (event === 'charge.failed') {
+      await creditOrFailTransaction(txn, 'failed', { reason: data.gateway_response, raw: data });
+    }
+    // Other event types (e.g. transfer.*, refund.*) are ignored here.
 
     res.status(200).json({ message: 'Webhook processed' });
   } catch (err) {
