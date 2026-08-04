@@ -74,55 +74,6 @@ async function reconcileMissedResponse(phone, amount) {
   }
 }
 
-// Fires the STK push and updates the transaction row with whatever happens,
-// but does NOT block the /initiate response — see comment below for why.
-async function sendStkPushInBackground(txn, nominee, normalizedPhone, amount) {
-  try {
-    // Initiating a push should be a quick API call (it just triggers the
-    // prompt — it does not wait for the customer to enter their PIN), so
-    // it gets its own short timeout instead of reusing the 30s client
-    // default meant for slower lookups like /status and /transactions.
-    const { data } = await fxsClient.post('/api/mpesa/stk-push', {
-      phone: normalizedPhone,
-      amount,
-      description: `${txn.votes_requested} vote(s) for ${nominee.full_name}`
-    }, { timeout: 10000 });
-
-    await supabase
-      .from('transactions')
-      .update({ fxs_reference: data.transactionId })
-      .eq('id', txn.id);
-
-  } catch (pushErr) {
-    // FXS Pay gave us an actual error response (bad request, auth issue,
-    // etc.) — this is a genuine failure, not just slowness.
-    if (pushErr.response && pushErr.response.status < 500) {
-      await supabase
-        .from('transactions')
-        .update({ status: 'failed', result_desc: pushErr.response.data?.error || 'Payment request rejected' })
-        .eq('id', txn.id);
-      return;
-    }
-
-    // Timeout, network blip, or a 5xx from FXS Pay — we genuinely don't
-    // know if the prompt went out. Try an immediate reconciliation check,
-    // but either way DON'T declare failure: a voter can take well over a
-    // minute to enter their PIN, and the /status polling (plus this same
-    // reconciliation check running again on every poll) has plenty more
-    // chances to catch up. Wrongly failing here is worse than a slightly
-    // optimistic "pending" — it's what was silently losing paid votes.
-    const match = await reconcileMissedResponse(normalizedPhone, amount);
-    if (match) {
-      await supabase
-        .from('transactions')
-        .update({ fxs_reference: match.id || match.transactionId })
-        .eq('id', txn.id);
-    } else {
-      console.error('[initiate] stk-push errored with no immediate match, leaving pending for status polling:', pushErr.message);
-    }
-  }
-}
-
 // POST /api/payments/initiate
 // body: { nomineeId, phone, votes }
 router.post('/initiate', initiateLimiter, async (req, res) => {
@@ -165,17 +116,57 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
 
     if (txnErr) return res.status(500).json({ error: txnErr.message });
 
-    // Respond as soon as the transaction is recorded — don't make the
-    // voter's spinner wait on FXS Pay's round-trip. The frontend starts
-    // polling /status right after this, which will pick up the
-    // fxs_reference (and eventual success/failure) once the background
-    // push below resolves.
-    res.json({
-      message: 'STK Push sent. Enter your M-Pesa PIN on your phone to complete payment.',
-      transactionId: txn.id
-    });
+    try {
+      const { data } = await fxsClient.post('/api/mpesa/stk-push', {
+        phone: normalizedPhone,
+        amount,
+        description: `${voteCount} vote(s) for ${nominee.full_name}`
+      });
 
-    sendStkPushInBackground(txn, nominee, normalizedPhone, amount);
+      // Got a clean response — save FXS Pay's transactionId as our matching key
+      await supabase
+        .from('transactions')
+        .update({ fxs_reference: data.transactionId })
+        .eq('id', txn.id);
+
+      return res.json({
+        message: data.message || 'STK Push sent. Enter your M-Pesa PIN on your phone to complete payment.',
+        transactionId: txn.id
+      });
+    } catch (pushErr) {
+      // FXS Pay gave us an actual error response (bad request, auth issue,
+      // etc.) — this is a genuine failure, not just slowness.
+      if (pushErr.response && pushErr.response.status < 500) {
+        await supabase
+          .from('transactions')
+          .update({ status: 'failed', result_desc: pushErr.response.data?.error || 'Payment request rejected' })
+          .eq('id', txn.id);
+        return res.status(502).json({ error: pushErr.response.data?.error || 'Could not start payment. Please try again.' });
+      }
+
+      // Timeout, network blip, or a 5xx from FXS Pay — we genuinely don't
+      // know if the prompt went out. Try an immediate reconciliation check,
+      // but either way DON'T declare failure: a voter can take well over a
+      // minute to enter their PIN, and the /status polling below (plus this
+      // same reconciliation check running again on every poll) has plenty
+      // more chances to catch up. Wrongly failing here is worse than a
+      // slightly optimistic "pending" — it's what was silently losing paid
+      // votes.
+      const match = await reconcileMissedResponse(normalizedPhone, amount);
+      if (match) {
+        await supabase
+          .from('transactions')
+          .update({ fxs_reference: match.id || match.transactionId })
+          .eq('id', txn.id);
+      } else {
+        console.error('[initiate] stk-push errored with no immediate match, leaving pending for status polling:', pushErr.message);
+      }
+
+      return res.json({
+        message: 'STK Push sent. If you don\u2019t see a prompt within a minute, you can try again.',
+        transactionId: txn.id
+      });
+    }
   } catch (err) {
     res.status(500).json({ error: 'Unexpected error initiating payment' });
   }
