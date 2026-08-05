@@ -90,38 +90,53 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Enter a valid Safaricom M-Pesa number' });
     }
 
-    const { data: nominee, error: nomErr } = await supabase
-      .from('nominees')
-      .select('id, full_name, is_active, category_id, categories!inner(is_active)')
-      .eq('id', nomineeId)
-      .single();
-
-    if (nomErr || !nominee || !nominee.is_active || !nominee.categories.is_active) {
-      return res.status(404).json({ error: 'Nominee not found or voting is closed for this category' });
-    }
-
     const amount = voteCount * VOTE_PRICE;
 
-    const { data: txn, error: txnErr } = await supabase
-      .from('transactions')
-      .insert({
-        nominee_id: nomineeId,
-        phone_number: normalizedPhone,
-        amount,
-        votes_requested: voteCount,
-        status: 'pending'
-      })
-      .select()
-      .single();
+    // Kick off the STK push immediately, in parallel with our own DB work —
+    // it doesn't need anything from the database, only phone + amount, so
+    // there's no reason to make it wait behind two Supabase round-trips.
+    const stkPromise = fxsClient.post('/api/mpesa/stk-push', {
+      phone: normalizedPhone,
+      amount,
+      description: `${voteCount} vote(s)`
+    });
+
+    const [nomineeResult, txnResult] = await Promise.all([
+      supabase
+        .from('nominees')
+        .select('id, full_name, is_active, category_id, categories!inner(is_active)')
+        .eq('id', nomineeId)
+        .single(),
+      supabase
+        .from('transactions')
+        .insert({
+          nominee_id: nomineeId,
+          phone_number: normalizedPhone,
+          amount,
+          votes_requested: voteCount,
+          status: 'pending'
+        })
+        .select()
+        .single()
+    ]);
+
+    const { data: nominee, error: nomErr } = nomineeResult;
+    const { data: txn, error: txnErr } = txnResult;
 
     if (txnErr) return res.status(500).json({ error: txnErr.message });
 
+    if (nomErr || !nominee || !nominee.is_active || !nominee.categories.is_active) {
+      // The STK push already fired by this point — can't take it back, but
+      // we can make sure it never gets credited as a vote.
+      await supabase
+        .from('transactions')
+        .update({ status: 'failed', result_desc: 'Nominee not found or voting closed for this category' })
+        .eq('id', txn.id);
+      return res.status(404).json({ error: 'Nominee not found or voting is closed for this category' });
+    }
+
     try {
-      const { data } = await fxsClient.post('/api/mpesa/stk-push', {
-        phone: normalizedPhone,
-        amount,
-        description: `${voteCount} vote(s) for ${nominee.full_name}`
-      });
+      const { data } = await stkPromise;
 
       // Got a clean response — save FXS Pay's transactionId as our matching key
       await supabase
@@ -134,24 +149,37 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
         transactionId: txn.id
       });
     } catch (pushErr) {
-      // FXS Pay gave us an actual error response (bad request, auth issue,
-      // etc.) — this is a genuine failure, not just slowness.
-      if (pushErr.response && pushErr.response.status < 500) {
+      // FXS Pay's server actually responded with an error (bad request, auth
+      // issue, or even a 5xx) — we know for certain it was received and
+      // rejected/errored, so there's no ambiguity to stay optimistic about.
+      if (pushErr.response) {
         await supabase
           .from('transactions')
-          .update({ status: 'failed', result_desc: pushErr.response.data?.error || 'Payment request rejected' })
+          .update({ status: 'failed', result_desc: pushErr.response.data?.error || `Payment provider returned ${pushErr.response.status}` })
           .eq('id', txn.id);
         return res.status(502).json({ error: pushErr.response.data?.error || 'Could not start payment. Please try again.' });
       }
 
-      // Timeout, network blip, or a 5xx from FXS Pay — we genuinely don't
-      // know if the prompt went out. Try an immediate reconciliation check,
-      // but either way DON'T declare failure: a voter can take well over a
-      // minute to enter their PIN, and the /status polling below (plus this
-      // same reconciliation check running again on every poll) has plenty
-      // more chances to catch up. Wrongly failing here is worse than a
-      // slightly optimistic "pending" — it's what was silently losing paid
-      // votes.
+      // No response at all — but two very different reasons can cause that:
+      const CONNECTION_LEVEL_CODES = ['ECONNREFUSED', 'ENOTFOUND', 'ENETUNREACH', 'EHOSTUNREACH', 'EAI_AGAIN'];
+      if (CONNECTION_LEVEL_CODES.includes(pushErr.code)) {
+        // The request never even reached FXS Pay's server (DNS failure,
+        // connection refused, network unreachable) — there is no ambiguity
+        // here, nothing was sent, so don't claim otherwise.
+        await supabase
+          .from('transactions')
+          .update({ status: 'failed', result_desc: `Could not connect to payment provider (${pushErr.code})` })
+          .eq('id', txn.id);
+        return res.status(502).json({ error: 'Could not reach the payment provider. Please try again.' });
+      }
+
+      // Genuinely ambiguous case: a connection was made but the response
+      // timed out (ECONNABORTED) before we heard back. FXS Pay may have
+      // still processed it — a voter can take well over a minute to enter
+      // their PIN, and the /status polling below (plus this same
+      // reconciliation check running again on every poll) has plenty more
+      // chances to catch up. Wrongly failing here is worse than a slightly
+      // optimistic "pending" — it's what was silently losing paid votes.
       const match = await reconcileMissedResponse(normalizedPhone, amount);
       if (match) {
         await supabase
@@ -159,7 +187,7 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
           .update({ fxs_reference: match.id || match.transactionId })
           .eq('id', txn.id);
       } else {
-        console.error('[initiate] stk-push errored with no immediate match, leaving pending for status polling:', pushErr.message);
+        console.error('[initiate] stk-push timed out with no immediate match, leaving pending for status polling:', pushErr.message);
       }
 
       return res.json({
