@@ -90,7 +90,7 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
         amount: amount * 100,
         currency: 'KES',
         mobile_money: {
-          phone: normalizedPhone,
+          phone: `+${normalizedPhone}`,
           provider: 'mpesa'
         }
       });
