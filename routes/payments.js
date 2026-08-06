@@ -79,9 +79,15 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
       // Paystack requires an email even though voters never provide one —
       // a synthetic address tied to the phone number is fine, it's never
       // actually emailed for this channel.
+      //
+      // Paystack reads `amount` in SUBUNITS for KES too (confirmed live:
+      // sending 20 for KSh 20 got "cannot be less than KES 1.00", which only
+      // makes sense if 20 was read as 20 subunits = KES 0.20). So this needs
+      // x100 here specifically — `amount` and everything in our own DB stays
+      // in whole KES, only the value sent to Paystack is converted.
       const { data } = await paystack.post('/charge', {
         email: `voter+${normalizedPhone}@kea-awards.local`,
-        amount,
+        amount: amount * 100,
         currency: 'KES',
         mobile_money: {
           phone: normalizedPhone,
