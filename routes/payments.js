@@ -86,7 +86,7 @@ router.post('/initiate', initiateLimiter, async (req, res) => {
       // x100 here specifically — `amount` and everything in our own DB stays
       // in whole KES, only the value sent to Paystack is converted.
       const { data } = await paystack.post('/charge', {
-        email: `voter+${normalizedPhone}@kea-awards.local`,
+        email: `v${normalizedPhone}@gmail.com`,
         amount: amount * 100,
         currency: 'KES',
         mobile_money: {
