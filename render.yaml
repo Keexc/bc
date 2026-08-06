@@ -14,11 +14,7 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
-      - key: FXS_BASE_URL
-        value: https://fxspay.onrender.com
-      - key: FXS_API_KEY
-        sync: false
-      - key: FXS_WEBHOOK_SECRET
+      - key: PAYSTACK_SECRET_KEY
         sync: false
       - key: VOTE_PRICE
         value: 20
